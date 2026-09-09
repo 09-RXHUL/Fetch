@@ -5,14 +5,15 @@ RUN apt-get update && apt-get install -y ffmpeg && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
+# Copy requirements first for better caching
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Add a startup script that upgrades yt-dlp and then starts the server
-COPY start.sh .
-RUN chmod +x start.sh
-
+# Copy the rest of the app
 COPY . .
 
-# Use the startup script as the container command
+# Make start.sh executable
+RUN chmod +x start.shs
+
+# Use start.sh as the container command
 CMD ["./start.sh"]
