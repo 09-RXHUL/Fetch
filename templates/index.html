@@ -1,0 +1,429 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Fetch – YouTube Audio Downloader</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.10.5/font/bootstrap-icons.css">
+    <style>
+        body { background: #f8f9fa; font-family: 'Segoe UI', sans-serif; }
+        .container { max-width: 1000px; margin-top: 30px; }
+        .track-card { transition: transform 0.1s, box-shadow 0.1s; border: none; border-radius: 12px; box-shadow: 0 2px 8px rgba(0,0,0,0.06); }
+        .track-card:hover { transform: translateY(-2px); box-shadow: 0 6px 16px rgba(0,0,0,0.1); }
+        .track-thumb { width: 80px; height: 60px; object-fit: cover; border-radius: 8px; }
+        .hidden { display: none; }
+        .terminal { background: #1e1e1e; color: #ccc; font-family: Consolas, monospace; font-size: 0.85rem; border-radius: 10px; padding: 15px; height: 250px; overflow-y: auto; white-space: pre-wrap; }
+        .log-line { margin: 0; }
+        .log-line.error { color: #ff6b6b; }
+        .log-line.success { color: #69db7c; }
+        .log-line.info { color: #74c0fc; }
+        .progress { height: 20px; }
+        .job-item { border-bottom: 1px solid #eee; padding: 10px 0; }
+    </style>
+</head>
+<body>
+<div class="container">
+    <h1 class="mb-4 text-center"><i class="bi bi-music-note-beamed"></i> Fetch</h1>
+    <p class="text-center text-muted mb-4">Download YouTube audio as MP3 or WAV</p>
+
+    <!-- Search / Fetch -->
+    <div class="row g-2 mb-4">
+        <div class="col-md-6">
+            <div class="input-group">
+                <input type="text" id="searchQuery" class="form-control" placeholder="Search YouTube...">
+                <button class="btn btn-primary" onclick="searchYouTube()"><i class="bi bi-search"></i> Search</button>
+            </div>
+        </div>
+        <div class="col-md-6">
+            <div class="input-group">
+                <input type="text" id="fetchUrl" class="form-control" placeholder="Or paste URL / Playlist">
+                <button class="btn btn-outline-primary" onclick="fetchFromUrl()"><i class="bi bi-cloud-download"></i> Fetch</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Toolbar -->
+    <div class="d-flex flex-wrap gap-2 mb-3">
+        <button class="btn btn-sm btn-outline-danger" onclick="clearTracks()"><i class="bi bi-trash"></i> Clear Tracks</button>
+        <button class="btn btn-sm btn-outline-secondary" onclick="toggleCollapse()" id="collapseBtn"><i class="bi bi-eye-slash"></i> Collapse Unselected</button>
+        <button class="btn btn-sm btn-outline-primary" onclick="selectAllFormat('mp3')">Select All MP3</button>
+        <button class="btn btn-sm btn-outline-primary" onclick="selectAllFormat('wav')">Select All WAV</button>
+        <button class="btn btn-sm btn-outline-info" onclick="updateEngine()"><i class="bi bi-arrow-clockwise"></i> Update Engine</button>
+    </div>
+
+    <!-- Results list -->
+    <div id="results" class="mb-4"></div>
+
+    <!-- Selected tracks summary -->
+    <div class="card shadow-sm mb-4">
+        <div class="card-header bg-white"><h5 class="mb-0"><i class="bi bi-check2-square"></i> Selected Tracks</h5></div>
+        <div class="card-body" id="selectedList"><p class="text-muted mb-0">No tracks selected yet.</p></div>
+    </div>
+
+    <!-- Download button -->
+    <button class="btn btn-success btn-lg w-100 mb-4" onclick="startDownload()"><i class="bi bi-download"></i> Download Selected</button>
+
+    <!-- Download All button -->
+    <button class="btn btn-warning btn-lg w-100 mb-4 d-none" id="downloadAllBtn" onclick="downloadAllFiles()">
+        <i class="bi bi-file-earmark-arrow-down"></i> Download All Completed Files
+    </button>
+
+    <!-- Progress area -->
+    <div id="downloadProgressArea" class="mb-4"></div>
+
+    <!-- Terminal log -->
+    <div class="card shadow-sm">
+        <div class="card-header bg-dark text-white"><i class="bi bi-terminal"></i> Process Terminal
+            <button class="btn btn-sm btn-outline-light float-end" onclick="clearTerminal()">Clear</button>
+        </div>
+        <div class="card-body p-2"><div id="terminal" class="terminal"></div></div>
+    </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+<script>
+    // ---------- State ----------
+    let tracks = [];
+    let selected = {};          // key: url|format -> {url, format}
+    let isCollapsed = false;
+    let urlToTitle = {};        // map url -> title
+    let activeJobIds = [];      // all job IDs from current session
+    let jobsInfo = {};          // jobId -> {status, title, file_path, ...}
+
+    // DOM elements
+    const resultsDiv = document.getElementById('results');
+    const selectedListDiv = document.getElementById('selectedList');
+    const collapseBtn = document.getElementById('collapseBtn');
+    const terminalDiv = document.getElementById('terminal');
+    const progressArea = document.getElementById('downloadProgressArea');
+    const downloadAllBtn = document.getElementById('downloadAllBtn');
+
+    // ---------- Terminal functions ----------
+    function appendLog(message, type = 'info') {
+        const line = document.createElement('div');
+        line.className = 'log-line ' + type;
+        line.textContent = message;
+        terminalDiv.appendChild(line);
+        terminalDiv.scrollTop = terminalDiv.scrollHeight;
+    }
+
+    function clearTerminal() {
+        terminalDiv.innerHTML = '';
+    }
+
+    // Local log (shown immediately)
+    function localLog(msg, type='info') {
+        appendLog('[client] ' + msg, type);
+    }
+
+    // Connect to server logs
+    function connectLogSocket() {
+        const protocol = location.protocol === 'https:' ? 'wss://' : 'ws://';
+        const socket = new WebSocket(protocol + location.host + '/ws/logs');
+        socket.onopen = () => localLog('Connected to server logs');
+        socket.onmessage = (event) => {
+            let msg = event.data;
+            let type = 'info';
+            if (msg.includes('ERROR') || msg.includes('failed')) type = 'error';
+            else if (msg.includes('completed') || msg.includes('success')) type = 'success';
+            appendLog(msg, type);
+        };
+        socket.onclose = () => {
+            localLog('Disconnected from server logs, reconnecting...', 'error');
+            setTimeout(connectLogSocket, 3000);
+        };
+        socket.onerror = () => localLog('WebSocket error', 'error');
+    }
+    connectLogSocket();
+
+    // ---------- Rendering tracks ----------
+    function renderTracks() {
+        resultsDiv.innerHTML = '';
+        if (tracks.length === 0) {
+            resultsDiv.innerHTML = '<p class="text-muted">No tracks available.</p>';
+            return;
+        }
+        tracks.forEach(track => {
+            const hasMp3 = selected[track.url + '|mp3'];
+            const hasWav = selected[track.url + '|wav'];
+            const isSelected = hasMp3 || hasWav;
+            const card = document.createElement('div');
+            card.className = 'card track-card mb-2';
+            if (isCollapsed && !isSelected) card.classList.add('hidden');
+            card.innerHTML = `
+                <div class="card-body d-flex align-items-center">
+                    <img src="${track.thumbnail}" class="track-thumb me-3" alt="">
+                    <div class="flex-grow-1">
+                        <h6 class="mb-1">${track.title}</h6>
+                        <small class="text-muted">${track.artist} · ${track.duration_str}</small>
+                    </div>
+                    <div class="form-check form-check-inline">
+                        <input class="form-check-input" type="checkbox" value="mp3" id="mp3_${track.id}" ${hasMp3?'checked':''} onchange="toggleSelection('${track.url}','mp3',this.checked)">
+                        <label class="form-check-label" for="mp3_${track.id}">MP3</label>
+                    </div>
+                    <div class="form-check form-check-inline">
+                        <input class="form-check-input" type="checkbox" value="wav" id="wav_${track.id}" ${hasWav?'checked':''} onchange="toggleSelection('${track.url}','wav',this.checked)">
+                        <label class="form-check-label" for="wav_${track.id}">WAV</label>
+                    </div>
+                    <button class="btn btn-sm btn-outline-danger ms-2" onclick="removeTrack('${track.id}')"><i class="bi bi-x"></i></button>
+                </div>`;
+            resultsDiv.appendChild(card);
+        });
+        updateSelectedList();
+    }
+
+    function toggleSelection(url, format, checked) {
+        const key = url + '|' + format;
+        if (checked) {
+            selected[key] = { url, format };
+            localLog(`Selected ${format.toUpperCase()} for ${urlToTitle[url] || url}`);
+        } else {
+            delete selected[key];
+            localLog(`Unselected ${format.toUpperCase()} for ${urlToTitle[url] || url}`);
+        }
+        updateSelectedList();
+        if (isCollapsed) renderTracks();
+    }
+
+    function updateSelectedList() {
+        const entries = Object.values(selected);
+        if (entries.length === 0) {
+            selectedListDiv.innerHTML = '<p class="text-muted mb-0">No tracks selected yet.</p>';
+            return;
+        }
+        let html = '<ul class="list-group list-group-flush">';
+        entries.forEach(e => {
+            const title = urlToTitle[e.url] || e.url;
+            html += `<li class="list-group-item d-flex justify-content-between align-items-center">
+                        <span>${e.format.toUpperCase()} · ${title}</span>
+                        <span class="badge bg-primary rounded-pill">${e.format.toUpperCase()}</span>
+                     </li>`;
+        });
+        html += '</ul>';
+        selectedListDiv.innerHTML = html;
+    }
+
+    function clearTracks() {
+        tracks = [];
+        selected = {};
+        isCollapsed = false;
+        collapseBtn.innerHTML = '<i class="bi bi-eye-slash"></i> Collapse Unselected';
+        urlToTitle = {};
+        activeJobIds = [];
+        jobsInfo = {};
+        downloadAllBtn.classList.add('d-none');
+        progressArea.innerHTML = '';
+        localLog('Cleared all tracks and selections');
+        renderTracks();
+    }
+
+    function removeTrack(id) {
+        const track = tracks.find(t => t.id === id);
+        if (track) {
+            delete selected[track.url + '|mp3'];
+            delete selected[track.url + '|wav'];
+            tracks = tracks.filter(t => t.id !== id);
+            localLog(`Removed track: ${track.title}`);
+            renderTracks();
+        }
+    }
+
+    function toggleCollapse() {
+        isCollapsed = !isCollapsed;
+        collapseBtn.innerHTML = isCollapsed ? '<i class="bi bi-eye"></i> Show All' : '<i class="bi bi-eye-slash"></i> Collapse Unselected';
+        localLog(isCollapsed ? 'Collapsed unselected tracks' : 'Showing all tracks');
+        renderTracks();
+    }
+
+    function selectAllFormat(format) {
+        tracks.forEach(track => {
+            selected[track.url + '|' + format] = { url: track.url, format };
+            const cb = document.getElementById(format + '_' + track.id);
+            if (cb) cb.checked = true;
+        });
+        localLog(`Selected all ${format.toUpperCase()}`);
+        updateSelectedList();
+        if (isCollapsed) renderTracks();
+    }
+
+    // ---------- Search / Fetch ----------
+    async function searchYouTube() {
+        const query = document.getElementById('searchQuery').value.trim();
+        if (!query) return alert('Enter a search query.');
+        localLog(`Searching YouTube: ${query}`);
+        const resp = await fetch('/search', {
+            method:'POST',
+            headers:{'Content-Type':'application/json'},
+            body: JSON.stringify({query, limit:5})
+        });
+        const data = await resp.json();
+        tracks = data.tracks || [];
+        tracks.forEach(t => urlToTitle[t.url] = t.title);
+        localLog(`Found ${tracks.length} results`);
+        renderTracks();
+    }
+
+    async function fetchFromUrl() {
+        const url = document.getElementById('fetchUrl').value.trim();
+        if (!url) return alert('Enter a URL.');
+        localLog(`Fetching metadata: ${url}`);
+        const resp = await fetch('/fetch', {
+            method:'POST',
+            headers:{'Content-Type':'application/json'},
+            body: JSON.stringify({url})
+        });
+        const data = await resp.json();
+        tracks = data.tracks || [];
+        tracks.forEach(t => urlToTitle[t.url] = t.title);
+        localLog(`Fetched ${tracks.length} tracks`);
+        renderTracks();
+    }
+
+    // ---------- Update Engine ----------
+    async function updateEngine() {
+        localLog('Requesting yt-dlp update...');
+        const resp = await fetch('/update_ytdlp', {method:'POST'});
+        const data = await resp.json();
+        alert(data.message || 'Update attempted. Check terminal.');
+    }
+
+    // ---------- Download ----------
+    async function startDownload() {
+        const items = Object.values(selected);
+        if (items.length === 0) return alert('Select at least one track.');
+        localLog(`Starting download of ${items.length} item(s)`);
+        // Clear old progress
+        progressArea.innerHTML = '';
+        downloadAllBtn.classList.add('d-none');
+        activeJobIds = [];
+        jobsInfo = {};
+
+        const downloadItems = items.map(item => ({
+            url: item.url,
+            format: item.format,
+            title: urlToTitle[item.url] || 'Unknown'
+        }));
+
+        const resp = await fetch('/download', {
+            method:'POST',
+            headers:{'Content-Type':'application/json'},
+            body: JSON.stringify({items: downloadItems})
+        });
+        const data = await resp.json();
+        const jobs = data.jobs;
+
+        jobs.forEach(job => {
+            activeJobIds.push(job.job_id);
+            jobsInfo[job.job_id] = { status: 'downloading', title: job.title, file_path: null };
+            createJobProgressUI(job.job_id, job.title);
+            pollJobProgress(job.job_id);
+        });
+    }
+
+    function createJobProgressUI(jobId, title) {
+        const jobDiv = document.createElement('div');
+        jobDiv.className = 'job-item';
+        jobDiv.id = `job-${jobId}`;
+        jobDiv.innerHTML = `
+            <div class="d-flex justify-content-between">
+                <strong>${title}</strong>
+                <span class="badge bg-secondary">starting</span>
+            </div>
+            <div class="progress mt-2">
+                <div class="progress-bar progress-bar-striped progress-bar-animated" style="width:0%"></div>
+            </div>
+            <div class="d-flex justify-content-between small text-muted mt-1">
+                <span class="downloaded">0 MB</span>
+                <span class="speed">0 KB/s</span>
+            </div>
+            <div class="mt-1"><a href="#" class="download-link d-none">Download file</a></div>
+        `;
+        progressArea.appendChild(jobDiv);
+    }
+
+    function pollJobProgress(jobId) {
+        const interval = setInterval(async () => {
+            const resp = await fetch(`/progress/${jobId}`);
+            if (!resp.ok) {
+                clearInterval(interval);
+                return;
+            }
+            const data = await resp.json();
+            jobsInfo[jobId] = data;
+
+            const jobDiv = document.getElementById(`job-${jobId}`);
+            if (!jobDiv) return;
+
+            const statusBadge = jobDiv.querySelector('.badge');
+            const progressBar = jobDiv.querySelector('.progress-bar');
+            const downloadedEl = jobDiv.querySelector('.downloaded');
+            const speedEl = jobDiv.querySelector('.speed');
+            const linkEl = jobDiv.querySelector('.download-link');
+
+            statusBadge.textContent = data.status;
+            if (data.status === 'completed') {
+                clearInterval(interval);
+                progressBar.style.width = '100%';
+                progressBar.classList.remove('progress-bar-animated');
+                progressBar.classList.add('bg-success');
+                statusBadge.className = 'badge bg-success';
+                linkEl.href = `/file/${jobId}`;
+                linkEl.classList.remove('d-none');
+                linkEl.textContent = 'Download file';
+                updateDownloadAllVisibility();
+            } else if (data.status === 'failed') {
+                clearInterval(interval);
+                progressBar.classList.add('bg-danger');
+                statusBadge.className = 'badge bg-danger';
+                linkEl.textContent = data.error || 'Failed';
+            } else {
+                let percent = 0;
+                if (data.total > 0) percent = (data.downloaded / data.total) * 100;
+                progressBar.style.width = percent + '%';
+                downloadedEl.textContent = formatBytes(data.downloaded);
+                speedEl.textContent = formatBytes(data.speed) + '/s';
+            }
+        }, 500);
+    }
+
+    function updateDownloadAllVisibility() {
+        const hasCompleted = Object.values(jobsInfo).some(j => j.status === 'completed');
+        if (hasCompleted) {
+            downloadAllBtn.classList.remove('d-none');
+        } else {
+            downloadAllBtn.classList.add('d-none');
+        }
+    }
+
+    // ---------- Download All Files (individual) ----------
+    function downloadAllFiles() {
+        const completedIds = Object.keys(jobsInfo).filter(jid => jobsInfo[jid].status === 'completed');
+        if (completedIds.length === 0) return alert('No completed downloads yet.');
+        localLog(`Starting download of ${completedIds.length} file(s)`);
+
+        // Trigger downloads with a delay to avoid browser blocking
+        completedIds.forEach((jid, index) => {
+            setTimeout(() => {
+                const link = document.createElement('a');
+                link.href = `/file/${jid}`;
+                link.download = ''; // Let server set filename
+                document.body.appendChild(link);
+                link.click();
+                link.remove();
+                localLog(`Downloading: ${jobsInfo[jid].title || jid}`);
+            }, index * 1000); // 1 second between each file
+        });
+    }
+
+    // ---------- Utility ----------
+    function formatBytes(bytes) {
+        if (!bytes || bytes <= 0) return '0 MB';
+        const units = ['B','KB','MB','GB'];
+        let i = 0;
+        while (bytes >= 1024 && i < units.length-1) { bytes /= 1024; i++; }
+        return bytes.toFixed(2) + ' ' + units[i];
+    }
+</script>
+</body>
+</html>
