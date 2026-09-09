@@ -4,14 +4,12 @@ import time
 import uuid
 import asyncio
 import threading
-import zipfile
-import io
 from typing import List
 from concurrent.futures import ThreadPoolExecutor
 import yt_dlp
 import requests
 from fastapi import FastAPI, HTTPException, BackgroundTasks, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel
 import uvicorn
 from mutagen.easyid3 import EasyID3
@@ -46,8 +44,6 @@ class LogCapture:
 
     def subscribe(self, ws: WebSocket):
         self.subscribers.add(ws)
-        for msg in self.messages[-100:]:
-            asyncio.run_coroutine_threadsafe(ws.send_text(msg), main_loop)
 
     def unsubscribe(self, ws: WebSocket):
         self.subscribers.discard(ws)
@@ -215,6 +211,10 @@ async def index():
     with open("templates/index.html", "r") as f:
         return HTMLResponse(f.read())
 
+@app.get("/healthz")
+async def healthz():
+    return {"status": "ok"}
+
 @app.post("/search")
 async def search(req: SearchRequest):
     log_capture.log(f"Searching YouTube: {req.query}")
@@ -289,7 +289,8 @@ async def get_file(job_id: str):
 
 @app.post("/download_all")
 async def download_all(req: DownloadAllRequest):
-    # Collect files from completed jobs
+    import zipfile
+    import io
     files_to_zip = []
     for jid in req.job_ids:
         job = active_jobs.get(jid)
@@ -298,45 +299,39 @@ async def download_all(req: DownloadAllRequest):
     if not files_to_zip:
         raise HTTPException(status_code=404, detail="No completed files found")
 
-    # Create ZIP in memory
     zip_buffer = io.BytesIO()
     with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
         for file_path, arcname in files_to_zip:
             zf.write(file_path, arcname)
     zip_buffer.seek(0)
-    return StreamingResponse(zip_buffer, media_type="application/zip", headers={"Content-Disposition": "attachment; filename=downloads.zip"})
+    from fastapi.responses import StreamingResponse
+    return StreamingResponse(zip_buffer, media_type="application/zip",
+                             headers={"Content-Disposition": "attachment; filename=downloads.zip"})
 
 @app.post("/update_ytdlp")
 async def update_ytdlp():
-    """Attempt to upgrade yt-dlp in the running environment (not persistent)."""
     log_capture.log("Updating yt-dlp via pip...")
-
-    def run_update():
-        try:
-            import subprocess
-            proc = subprocess.run(
-                ["pip", "install", "--upgrade", "yt-dlp"],
-                capture_output=True,
-                text=True,
-                timeout=120  # seconds
-            )
-            if proc.returncode == 0:
-                log_capture.log("yt-dlp updated successfully. (Temporary – will not survive a restart.)")
-            else:
-                log_capture.log(f"pip update failed: {proc.stderr}")
-        except Exception as e:
-            log_capture.log(f"Update error: {e}")
-
-    # Run in a separate thread to avoid blocking the event loop
-    threading.Thread(target=run_update, daemon=True).start()
-
-    return {"status": "started", "message": "Update started. Check terminal for progress."}
+    try:
+        import subprocess
+        proc = subprocess.run(["pip", "install", "--upgrade", "yt-dlp"], capture_output=True, text=True)
+        if proc.returncode == 0:
+            log_capture.log("yt-dlp updated successfully. (Temporary, will not survive restart.)")
+            return {"status": "success", "message": "yt-dlp updated successfully."}
+        else:
+            log_capture.log(f"pip update failed: {proc.stderr}")
+            return {"status": "error", "message": proc.stderr}
+    except Exception as e:
+        log_capture.log(f"Update error: {e}")
+        return {"status": "error", "message": str(e)}
 
 # WebSocket for logs
 @app.websocket("/ws/logs")
 async def websocket_logs(websocket: WebSocket):
     await websocket.accept()
     log_capture.subscribe(websocket)
+    # Send history
+    for msg in log_capture.messages[-100:]:
+        await websocket.send_text(msg)
     try:
         while True:
             await websocket.receive_text()
