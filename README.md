@@ -242,5 +242,3 @@ This project is provided as-is without any warranty. Feel free to modify and use
 ```
 
 ---
-
-You can copy the above content into a `README.md` file and place it in the root of your repository. It covers everything a user or developer needs to understand, run, deploy, and troubleshoot your app.
