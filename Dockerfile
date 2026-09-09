@@ -13,7 +13,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 
 # Make start.sh executable
-RUN chmod +x start.shs
+RUN chmod +x start.sh
 
 # Use start.sh as the container command
 CMD ["./start.sh"]
